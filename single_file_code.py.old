@@ -1,0 +1,167 @@
+import threading
+import sqlite3
+import time
+import random
+import configparser
+import logging
+
+# Configuration
+config = configparser.ConfigParser()
+config.read('config.ini')
+
+MAX_RETRIES = int(config['DEFAULT']['max_retries'])
+DB_FILENAME = config['DEFAULT']['db_filename']
+MAX_THREADS = int(config['DEFAULT']['max_threads'])
+RANDOM_WAIT_RANGE = int(config['DEFAULT']['random_wait_range'])
+FAILURE_PROBABILITY = float(config['DEFAULT']['failure_probability'])
+
+# Logging Configuration
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[logging.StreamHandler(), logging.FileHandler("scheduler.log")])
+
+logging.info("Configuration loaded")
+
+# Database setup
+conn = sqlite3.connect(DB_FILENAME)
+cursor = conn.cursor()
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS tasks (
+    name TEXT PRIMARY KEY,
+    start_time TEXT,
+    end_time TEXT,
+    status TEXT,
+    retry_count INTEGER
+)''')
+conn.commit()
+logging.info("Database setup completed")
+
+class Task:
+    """Base Task class"""
+    def run(self):
+        raise NotImplementedError("You need to implement the 'run' method")
+
+class ExampleTask(Task):
+    """An example task that fails based on a probability"""
+    def run(self):
+        wait_seconds = random.randint(1, RANDOM_WAIT_RANGE)
+        time.sleep(wait_seconds)
+
+        if random.random() < FAILURE_PROBABILITY:
+            logging.error(f"{threading.current_thread().name} failed due to configured probability.")
+            raise Exception("Task failed due to configured probability.")
+        logging.info(f"{threading.current_thread().name} has finished")
+
+class ScheduledTask:
+    """Represents a scheduled task with retry logic"""
+    STATUS_FOR_RETRY = ['failed','scheduled']
+
+    def __init__(self, task_name, task):
+        self.task_name = task_name
+        self.task = task
+        self.status = self.load_status_from_db()
+        self.retry_count = self.load_retry_count_from_db()  # Load retry count from DB
+
+    def load_retry_count_from_db(self):
+        with sqlite3.connect(DB_FILENAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT retry_count FROM tasks WHERE name = ?', (self.task_name,))
+            result = cursor.fetchone()
+            if result:
+                return result[0]
+            return 0  # Default to 0 if the task doesn't exist in the database
+
+    def load_status_from_db(self):
+        with sqlite3.connect(DB_FILENAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT status FROM tasks WHERE name = ?', (self.task_name,))
+            result = cursor.fetchone()
+            if result:
+                return result[0]
+            return 'scheduled'  # Default to 'scheduled' if the task doesn't exist in the database
+
+
+    def execute(self, queue):
+        current_status = self.load_status_from_db()
+        if not current_status in self.STATUS_FOR_RETRY:
+            logging.info(f"Skipping {self.task_name} as its status is not retryable")
+            return
+
+        logging.info(f"Executing task: {self.task_name}")
+        self.start_time = time.time()
+
+        try:
+            self.task.run()
+            self.status = 'completed'
+        except Exception as e:
+            logging.error(f"Error occurred for {self.task_name}: {str(e)}")
+            self.retry_count += 1
+            if self.retry_count >= MAX_RETRIES:
+                self.status = 'permanently failed'
+            else:
+                self.status = 'failed'  # Set the status to failed until the next run
+
+        self.end_time = time.time()
+        self._persist_to_db()
+
+        # If the task failed and hasn't reached max retries, re-add to the queue
+        if self.status in self.STATUS_FOR_RETRY:
+            logging.info(f"Re-adding {self.task_name} to the queue for retry")
+            queue.append(self)
+
+    def _persist_to_db(self):
+        with sqlite3.connect(DB_FILENAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+            INSERT OR REPLACE INTO tasks (name, start_time, end_time, status, retry_count)
+            VALUES (?, ?, ?, ?, ?)
+            ''', (self.task_name, str(self.start_time), str(self.end_time), self.status, self.retry_count))
+            conn.commit()
+
+class Scheduler:
+    """Scheduler to manage and run tasks concurrently"""
+    def __init__(self, tasks):
+        self.tasks = [ScheduledTask(f"task-{i}", task) for i, task in enumerate(tasks)]
+        self.queue = self.tasks.copy()
+        self.semaphore = threading.Semaphore(MAX_THREADS)
+
+    def worker(self, task):
+        """Worker function to execute tasks with semaphore for concurrency control"""
+        with self.semaphore:
+            task.execute(self.queue)
+
+    def run(self):
+        while self.queue:
+            # Start a batch of tasks up to MAX_THREADS
+            threads = []
+            for _ in range(min(MAX_THREADS, len(self.queue))):
+                task = self.queue.pop(0)
+                thread = threading.Thread(target=self.worker, args=(task,))
+                threads.append(thread)
+                thread.start()
+
+            # Wait for the current batch of threads to finish
+            for thread in threads:
+                thread.join()
+
+        self.print_summary()
+
+    def print_summary(self):
+        print("\n--- Task Summary ---")
+        print(f"{'Task Name':<15} {'Status':<10} {'Start Time':<20} {'End Time':<20} {'Retry Count'}")
+        print("-" * 75)
+        with sqlite3.connect(DB_FILENAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT name, status, start_time, end_time, retry_count FROM tasks')
+            for row in cursor.fetchall():
+                print(
+                    f"{row[0]:<15} {row[1]:<10} {time.ctime(float(row[2])):<20} {time.ctime(float(row[3])):<20} {row[4]}")
+
+if __name__ == '__main__':
+    logging.info("Starting the scheduler")
+    # Get the list of tasks to run
+    num_tasks = 5
+    tasks = [ExampleTask() for _ in range(num_tasks)]
+    # Schedule and run the tasks
+    scheduler = Scheduler(tasks)
+    scheduler.run()
