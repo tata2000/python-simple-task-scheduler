@@ -1,18 +1,61 @@
+import logging
 import sqlite3
 import datetime
+import threading
 
-from task import Task
-from config import RETRY_COUNT
+from config import RETRY_COUNT, MAX_SLEEP_DURATION, MAX_THREADS
 
 
 class Scheduler:
     def __init__(self):
-        """
-        Initialize the Scheduler. 
-        Sets up the SQLite database connection and tables.
-        """
-        self.conn = sqlite3.connect('tasks.db')
+        self.conn = sqlite3.connect('tasks.db', check_same_thread=False)
         self._initialize_db()
+        self.semaphore = threading.Semaphore(MAX_THREADS)
+
+
+    def _execute_task(self, task):
+        with self.semaphore:
+            task_name = task.name
+
+            with self.conn:
+                cursor = self.conn.execute("SELECT status FROM tasks WHERE name=?", (task_name,))
+                status = cursor.fetchone()
+                if status and status[0] == 'completed':
+                    logging.info(f"Task {task_name} already completed.")
+                    return
+
+            task_thread = threading.Thread(target=task.run)
+            task_thread.start()
+            task_thread.join(timeout=MAX_SLEEP_DURATION + 5)
+
+            if task_thread.is_alive():
+                logging.warning(f"Task {task.name} is stuck. Killing it...")
+                task.remove()
+                self._mark_killed(task_name)
+            elif task.is_error():
+                self._log_failure(task.name)
+            else:
+                self._mark_completed(task_name)
+
+    def _mark_killed(self, task_name):
+        """
+        Mark a task as killed in the database.
+
+        :param task_name: Unique name of the killed task.
+        """
+        with self.conn:
+            cursor = self.conn.execute("SELECT name FROM tasks WHERE name=?", (task_name,))
+            row = cursor.fetchone()
+
+            if row:
+                # Update the existing record with status 'killed'
+                self.conn.execute("UPDATE tasks SET status='killed' WHERE name=?", (task_name,))
+            else:
+                # Insert a new record for the task with status 'killed'
+                self.conn.execute("INSERT INTO tasks (name, status, retry_count) VALUES (?, 'killed', 0)", (task_name,))
+
+            print(f"Task {task_name} was killed due to being stuck.")
+
 
     def _initialize_db(self):
         """
@@ -27,31 +70,6 @@ class Scheduler:
                 completed_timestamp TEXT
             )
             """)
-
-    def _execute_task(self, task):
-        """
-        Execute a given task.
-        Checks if the task was previously completed before execution.
-
-        :param task: Task instance to be executed.
-        """
-        # Use task.name as the identifier
-        task_name = task.name
-
-        # Check if task was already completed
-        with self.conn:
-            cursor = self.conn.execute("SELECT status FROM tasks WHERE name=?", (task_name,))
-            status = cursor.fetchone()
-            if status and status[0] == 'completed':
-                print(f"Task {task_name} already completed.")
-                return
-
-        task.run()
-
-        if task.is_error():
-            self._log_failure(task_name)
-        else:
-            self._mark_completed(task_name)
 
     def _log_failure(self, task_name):
         """
@@ -102,12 +120,19 @@ class Scheduler:
 
             print(f"Task {task_name} completed successfully at {current_time}.")
 
+    def _monitor_process(self, process, task, timeout):
+        """Monitor a process and terminate it if it exceeds the timeout."""
+        process.join(timeout=timeout)
+        if process.is_alive():
+            logging.warning(f"Task {task.name} exceeded its runtime. Terminating it...")
+            process.terminate()
+
     def _print_summary(self):
         """
         Print a summary of all tasks, including their status, execution time, and any errors, in table format.
         """
         with self.conn:
-            cursor = self.conn.execute("SELECT name, status, retry_count, completed_timestamp FROM tasks")
+            cursor = self.conn.execute("SELECT name, status, retry_count, completed_timestamp FROM tasks ORDER BY name")
             rows = cursor.fetchall()
 
             # Print table header
@@ -135,27 +160,58 @@ class Scheduler:
         if self.conn:
             self.conn.close()
 
+    # def schedule(self, tasks):
+    #     """
+    #     Schedule a list of tasks for execution.
+    #
+    #     :param tasks: List of Task instances to be executed.
+    #     """
+    #     semaphore = multiprocessing.Semaphore(MAX_THREADS)  # Controls the number of concurrent processes
+    #
+    #     def worker(task):
+    #         with semaphore:
+    #             self._execute_task(task)
+    #
+    #     for task in tasks:
+    #         # Use task.name as the identifier
+    #         task_name = task.name
+    #
+    #         # Check if task was already completed or permanently failed
+    #         with self.conn:
+    #             cursor = self.conn.execute("SELECT status FROM tasks WHERE name=?", (task_name,))
+    #             status = cursor.fetchone()
+    #             if status:
+    #                 if status[0] == 'completed':
+    #                     logging.info(f"Task {task_name} already completed.")
+    #                     continue
+    #                 elif status[0] == 'permanently failed':
+    #                     logging.info(f"Task {task_name} has permanently failed.")
+    #                     continue
+    #
+    #         # Start the task in a separate process
+    #         process = multiprocessing.Process(target=worker, args=(task,))
+    #         process.start()
+    #
+    #         # Monitor the process and terminate it if it exceeds the expected runtime
+    #         self._monitor_process(process, task, MAX_SLEEP_DURATION + 5)
+    #
+    #     logging.info("All tasks have been executed.")
+
     def schedule(self, tasks):
         """
         Schedule a list of tasks for execution.
 
         :param tasks: List of Task instances to be executed.
         """
+        threads = []
+
         for task in tasks:
-            # Use task.name as the identifier
-            task_name = task.name
+            t = threading.Thread(target=self._execute_task, args=(task,))
+            threads.append(t)
+            t.start()
 
-            # Check if task was already completed or permanently failed
-            with self.conn:
-                cursor = self.conn.execute("SELECT status FROM tasks WHERE name=?", (task_name,))
-                status = cursor.fetchone()
-                if status:
-                    if status[0] == 'completed':
-                        print(f"Task {task_name} already completed.")
-                        continue
-                    elif status[0] == 'permanently failed':
-                        print(f"Task {task_name} has permanently failed.")
-                        continue
+        # Wait for all threads to complete
+        for t in threads:
+            t.join()
 
-            # If task was neither previously completed nor permanently failed, execute it
-            self._execute_task(task)
+        logging.info("All tasks have been executed.")
